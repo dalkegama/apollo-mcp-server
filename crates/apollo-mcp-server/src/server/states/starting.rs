@@ -110,6 +110,9 @@ impl Starting {
         )
         .map_err(ServerError::Apps)?;
         warn_app_tool_collisions(&self.config.param_headers, &apps);
+        if self.config.expose_all_apps {
+            crate::apps::ensure_unique_names(&apps).map_err(ServerError::Apps)?;
+        }
         let prompts = crate::prompts::load_from_path(&self.config.prompts_dir)
             .map_err(ServerError::Prompts)?;
         let schema = Arc::new(RwLock::new(self.schema));
@@ -170,6 +173,7 @@ impl Starting {
             schema,
             operations: Arc::new(RwLock::new(operations)),
             apps,
+            expose_all_apps: self.config.expose_all_apps,
             prompts,
             headers: self.config.headers,
             forward_headers: self.config.forward_headers.clone(),
@@ -527,6 +531,7 @@ mod tests {
         Config {
             rhai_dir: std::path::PathBuf::from("rhai"),
             apps_dir: std::path::PathBuf::from("apps"),
+            expose_all_apps: false,
             prompts_dir: std::path::PathBuf::from("prompts"),
             transport: Transport::StreamableHttp {
                 auth: None,

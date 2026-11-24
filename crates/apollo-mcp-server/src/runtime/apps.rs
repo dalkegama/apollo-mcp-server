@@ -10,12 +10,18 @@ pub struct AppsConfig {
     /// Directory containing MCP Apps. Each subdirectory holding an
     /// `.application-manifest.json` file is loaded as an app.
     pub path: PathBuf,
+
+    /// Serve every app on a connection that has no `app` query parameter.
+    /// The connection lists each app's tools and resources alongside the
+    /// operation tools and the enabled built-in tools.
+    pub expose_all: bool,
 }
 
 impl Default for AppsConfig {
     fn default() -> Self {
         Self {
             path: PathBuf::from("apps"),
+            expose_all: false,
         }
     }
 }
@@ -35,6 +41,20 @@ mod tests {
             .expect("Apps config should parse");
 
         assert_eq!(config.path, std::path::PathBuf::from("/config/apps"));
+    }
+
+    #[test]
+    fn expose_all_defaults_to_false() {
+        assert!(!AppsConfig::default().expose_all);
+    }
+
+    #[test]
+    fn deserializes_expose_all() {
+        let config = yaml_serde::from_str::<AppsConfig>("expose_all: true\n")
+            .expect("Apps config should parse");
+
+        assert!(config.expose_all);
+        assert_eq!(config.path, std::path::PathBuf::from("apps"));
     }
 
     #[test]

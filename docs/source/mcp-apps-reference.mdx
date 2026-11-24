@@ -208,6 +208,28 @@ Use the `app` query parameter to specify which app to load: `https://your-server
 
 </Note>
 
+## Serving every app on one connection
+
+By default, a connection sees one app, and only when its URL has the `app` query parameter. To serve every app on a connection that has no `app` parameter, set `apps.expose_all` in your server's config file:
+
+```yaml title="mcp.yaml"
+apps:
+  expose_all: true
+```
+
+A client that connects to `https://your-server.com/mcp` then gets:
+
+- Your operation tools and the built-in tools you enabled (`execute`, `introspect`, `search`, `validate`), unchanged.
+- The tools of every app, each pointing at its own app's UI resource.
+- The UI resource of every app in `resources/list`.
+
+Tool names must be unique in this mode:
+
+- If two apps define a tool with the same name, or two apps share a name, the server fails to start.
+- If an app tool has the same name as an operation tool or a built-in tool, the operation or built-in tool is listed and called, and the app tool is hidden.
+
+A connection that has the `app` query parameter still sees only that app.
+
 ## App target
 
 Apollo MCP Server supports two targets: OpenAI Apps (for hosts supporting OpenAI's Apps SDK specification) and MCP Apps (for MCP-compatible clients). Use the `appTarget` query parameter to specify the target.
@@ -215,6 +237,8 @@ Apollo MCP Server supports two targets: OpenAI Apps (for hosts supporting OpenAI
 OpenAI Apps: `https://your-server.com/mcp?app=my-app&appTarget=openai`
 
 MCP Apps: `https://your-server.com/mcp?app=my-app&appTarget=mcp`
+
+If your app is built for only one target, the server serves that target's resource when the URL has no `appTarget` parameter.
 
 ## TypeScript configuration
 

@@ -36,12 +36,14 @@ pub(crate) async fn get_app_resource(
     request: rmcp::model::ReadResourceRequestParams,
     request_uri: Url,
     app_target: &AppTarget,
-    app_name: &str,
+    app_name: Option<&str>,
+    target_is_explicit: bool,
 ) -> Result<(ResourceContents, ResourceOrigin), ErrorData> {
-    let Some(app) = apps
-        .iter()
-        .find(|app| app.uri.path() == request_uri.path() && app.name == app_name)
-    else {
+    // With no app name the request is not scoped to one app, so the URI alone
+    // selects the resource.
+    let Some(app) = apps.iter().find(|app| {
+        app.uri.path() == request_uri.path() && app_name.is_none_or(|name| app.name == name)
+    }) else {
         return Err(ErrorData::resource_not_found(
             format!("Resource not found for URI: {}", request.uri),
             None,
@@ -49,20 +51,23 @@ pub(crate) async fn get_app_resource(
     };
 
     let resource_source = match &app.resource {
-        AppResource::Targeted(resource) => match app_target {
-            AppTarget::AppsSDK => resource.openai.as_ref().ok_or_else(|| {
+        AppResource::Targeted(resource) => {
+            let (wanted, other, target_name) = match app_target {
+                AppTarget::AppsSDK => (&resource.openai, &resource.mcp, "openai"),
+                AppTarget::MCPApps => (&resource.mcp, &resource.openai, "mcp"),
+            };
+            // A target the request named must match exactly. A target the
+            // server only assumed can fall back to the one resource the app
+            // was built with, so an app built for a single target works
+            // without an `appTarget` query parameter.
+            let fallback = if target_is_explicit { &None } else { other };
+            wanted.as_ref().or(fallback.as_ref()).ok_or_else(|| {
                 ErrorData::resource_not_found(
-                    "Invalid apps target: no resource found for openai".to_string(),
+                    format!("Invalid apps target: no resource found for {target_name}"),
                     None,
                 )
-            })?,
-            AppTarget::MCPApps => resource.mcp.as_ref().ok_or_else(|| {
-                ErrorData::resource_not_found(
-                    "Invalid apps target: no resource found for mcp".to_string(),
-                    None,
-                )
-            })?,
-        },
+            })?
+        }
         AppResource::Single(app_resource_source) => app_resource_source,
     };
 
@@ -239,7 +244,8 @@ mod tests {
             rmcp::model::ReadResourceRequestParams::new("ui://widget/TestApp"),
             "ui://widget/TestApp".parse().unwrap(),
             &target,
-            "TestApp",
+            Some("TestApp"),
+            true,
         )
         .await
         .unwrap();
@@ -325,7 +331,8 @@ mod tests {
             rmcp::model::ReadResourceRequestParams::new("ui://widget/TestApp"),
             "ui://widget/TestApp".parse().unwrap(),
             &AppTarget::AppsSDK,
-            "TestApp",
+            Some("TestApp"),
+            true,
         )
         .await
         .unwrap();
@@ -386,7 +393,8 @@ mod tests {
             rmcp::model::ReadResourceRequestParams::new("ui://widget/TestApp"),
             "ui://widget/TestApp".parse().unwrap(),
             &AppTarget::MCPApps,
-            "TestApp",
+            Some("TestApp"),
+            true,
         )
         .await
         .unwrap();
@@ -438,7 +446,8 @@ mod tests {
             rmcp::model::ReadResourceRequestParams::new("ui://widget/TestApp"),
             "ui://widget/TestApp".parse().unwrap(),
             &target,
-            "TestApp",
+            Some("TestApp"),
+            true,
         )
         .await
         .unwrap();
@@ -468,7 +477,8 @@ mod tests {
             rmcp::model::ReadResourceRequestParams::new("ui://widget/NonExistent"),
             "ui://widget/NonExistent".parse().unwrap(),
             &AppTarget::AppsSDK,
-            "TestApp",
+            Some("TestApp"),
+            true,
         )
         .await;
 
@@ -493,7 +503,8 @@ mod tests {
             rmcp::model::ReadResourceRequestParams::new("ui://widget/TestApp"),
             "ui://widget/TestApp".parse().unwrap(),
             &AppTarget::AppsSDK,
-            "WrongApp",
+            Some("WrongApp"),
+            true,
         )
         .await;
 
@@ -521,7 +532,8 @@ mod tests {
             rmcp::model::ReadResourceRequestParams::new("ui://widget/TestApp"),
             "ui://widget/TestApp".parse().unwrap(),
             &AppTarget::AppsSDK,
-            "TestApp",
+            Some("TestApp"),
+            true,
         )
         .await
         .unwrap();
@@ -553,7 +565,8 @@ mod tests {
             rmcp::model::ReadResourceRequestParams::new("ui://widget/TestApp"),
             "ui://widget/TestApp".parse().unwrap(),
             &AppTarget::MCPApps,
-            "TestApp",
+            Some("TestApp"),
+            true,
         )
         .await
         .unwrap();
@@ -585,7 +598,8 @@ mod tests {
             rmcp::model::ReadResourceRequestParams::new("ui://widget/TestApp"),
             "ui://widget/TestApp".parse().unwrap(),
             &AppTarget::MCPApps,
-            "TestApp",
+            Some("TestApp"),
+            true,
         )
         .await;
 

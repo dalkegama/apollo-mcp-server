@@ -388,6 +388,7 @@ mod test {
             Config {
                 apps: AppsConfig {
                     path: "apps",
+                    expose_all: false,
                 },
                 caching: Caching {
                     ttl_ms: 300000,

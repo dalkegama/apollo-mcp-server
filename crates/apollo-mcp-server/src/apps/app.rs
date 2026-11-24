@@ -80,20 +80,25 @@ pub(crate) enum AppTarget {
     MCPApps,
 }
 
+/// Reads the `appTarget` query parameter from the request, if it has one.
+pub(crate) fn app_target_param(extensions: &Extensions) -> Option<String> {
+    extensions
+        .get::<axum::http::request::Parts>()
+        .and_then(|parts| parts.uri.query())
+        .and_then(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .find(|(key, _)| key == "appTarget")
+                .map(|(_, value)| value.into_owned())
+        })
+}
+
 impl TryFrom<(Extensions, Option<&ClientCapabilities>)> for AppTarget {
     type Error = McpError;
 
     fn try_from(
         (extensions, client_capabilities): (Extensions, Option<&ClientCapabilities>),
     ) -> Result<Self, Self::Error> {
-        let app_target_param = extensions
-            .get::<axum::http::request::Parts>()
-            .and_then(|parts| parts.uri.query())
-            .and_then(|query| {
-                url::form_urlencoded::parse(query.as_bytes())
-                    .find(|(key, _)| key == "appTarget")
-                    .map(|(_, value)| value.into_owned())
-            });
+        let app_target_param = app_target_param(&extensions);
 
         match app_target_param {
             Some(app_target) if app_target.to_lowercase() == "openai" => Ok(AppTarget::AppsSDK),

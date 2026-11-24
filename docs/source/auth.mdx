@@ -473,6 +473,8 @@ Every tool call uses the method name `tools/call`, so listing it there would mak
 
 For the same reason, a `tools/call` that carries an `?app=` query parameter never matches the `tools` list. That parameter makes the server run the named app's own tool instead of the operation the name refers to, so the name in `tools` would not identify what actually executes. Those calls always require a token.
 
+With [`apps.expose_all`](/apollo-mcp-server/mcp-apps-reference#serving-every-app-on-one-connection), app tools are also reachable without the `app` parameter. A name in `tools` then matches an app tool when no operation or built-in tool has that name.
+
 ### The header list moves authentication, it does not remove it
 
 A request that carries a listed header skips token validation, and a later layer authenticates it. Apollo MCP Server cannot judge a credential it does not understand, so it only reads whether the header is present.

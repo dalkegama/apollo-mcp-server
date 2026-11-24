@@ -128,15 +128,17 @@ Apollo MCP Server supports OAuth 2.1 authentication that follows best practices 
 
 ### Apps
 
-Set these fields under the top-level `apps` key to tell Apollo MCP Server where to load MCP Apps from. Learn more about [MCP Apps](/apollo-mcp-server/mcp-apps).
+Set these fields under the top-level `apps` key to tell Apollo MCP Server where to load MCP Apps from and how to serve them. Learn more about [MCP Apps](/apollo-mcp-server/mcp-apps).
 
-| Option | Type       | Default | Description                                                                                                                         |
-| :----- | :--------- | :------ | :---------------------------------------------------------------------------------------------------------------------------------- |
-| `path` | `FilePath` | `apps`  | Directory containing MCP Apps. Apollo MCP Server loads each subdirectory that holds an `.application-manifest.json` file as an app. |
+| Option       | Type       | Default | Description                                                                                                                                                                                                  |
+| :----------- | :--------- | :------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `path`       | `FilePath` | `apps`  | Directory containing MCP Apps. Apollo MCP Server loads each subdirectory that holds an `.application-manifest.json` file as an app.                                                                          |
+| `expose_all` | `bool`     | `false` | Serve every app on connections that have no `app` query parameter. See [Serving every app on one connection](/apollo-mcp-server/mcp-apps-reference#serving-every-app-on-one-connection).                     |
 
 ```yaml title="mcp.yaml"
 apps:
   path: /config/apps
+  expose_all: true
 ```
 
 Use an absolute path, or a path relative to your server's working directory. If the directory doesn't exist, the server starts without apps.

@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -39,7 +39,7 @@ use tracing::{Instrument as _, debug, error, info};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use url::Url;
 
-use crate::apps::app::AppTarget;
+use crate::apps::app::{AppTarget, app_target_param};
 use crate::apps::app_param_from_query;
 use crate::apps::resource::{attach_resource_mime_type, get_app_resource};
 use crate::apps::tool::{attach_tool_metadata, find_and_execute_app_tool, make_tool_private};
@@ -72,6 +72,8 @@ pub(super) struct Running {
     pub(super) schema: Arc<RwLock<Valid<Schema>>>,
     pub(super) operations: Arc<RwLock<Vec<Operation>>>,
     pub(super) apps: Vec<crate::apps::App>,
+    /// Serve every app on connections that carry no `app` query parameter.
+    pub(super) expose_all_apps: bool,
     pub(super) prompts: Vec<crate::prompts::PromptFile>,
     pub(super) headers: HeaderMap,
     pub(super) forward_headers: ForwardHeaders,
@@ -361,16 +363,34 @@ impl Running {
                 }
             }
         } else {
-            ListToolsResult::with_all_items(
-                operation_tools
-                    .into_iter()
-                    .chain(self.execute_tool.as_ref().iter().map(|e| e.tool.clone()))
-                    .chain(self.introspect_tool.as_ref().iter().map(|e| e.tool.clone()))
-                    .chain(self.search_tool.as_ref().iter().map(|e| e.tool.clone()))
-                    .chain(self.explorer_tool.as_ref().iter().map(|e| e.tool.clone()))
-                    .chain(self.validate_tool.as_ref().iter().map(|e| e.tool.clone()))
-                    .collect(),
-            )
+            let mut tools: Vec<Tool> = operation_tools
+                .into_iter()
+                .chain(self.execute_tool.as_ref().iter().map(|e| e.tool.clone()))
+                .chain(self.introspect_tool.as_ref().iter().map(|e| e.tool.clone()))
+                .chain(self.search_tool.as_ref().iter().map(|e| e.tool.clone()))
+                .chain(self.explorer_tool.as_ref().iter().map(|e| e.tool.clone()))
+                .chain(self.validate_tool.as_ref().iter().map(|e| e.tool.clone()))
+                .collect();
+
+            if self.expose_all_apps {
+                // Operation and built-in tools win a name clash, matching the
+                // order call_tool_impl resolves a name in, so a listed tool is
+                // always the one a call reaches.
+                let taken: HashSet<_> = tools.iter().map(|tool| tool.name.clone()).collect();
+                let app_tools: Vec<Tool> = self
+                    .apps
+                    .iter()
+                    .flat_map(|app| {
+                        app.tools
+                            .iter()
+                            .map(|tool| attach_tool_metadata(app, tool, &app_target))
+                    })
+                    .filter(|tool| !taken.contains(&tool.name))
+                    .collect();
+                tools.extend(app_tools);
+            }
+
+            ListToolsResult::with_all_items(tools)
         };
 
         if !self.client_supports_output_schema(peer.protocol_version) {
@@ -408,7 +428,18 @@ impl Running {
                 app.name == app_name && app.tools.iter().any(|tool| tool.tool.name == name)
             });
         }
-        operation.is_some()
+        operation.is_some() || self.exposed_app_for_tool(name).is_some()
+    }
+
+    /// The app that serves `tool_name` on a connection with no `app` query
+    /// parameter, when `apps.expose_all` is on.
+    fn exposed_app_for_tool(&self, tool_name: &str) -> Option<&crate::apps::App> {
+        if !self.expose_all_apps {
+            return None;
+        }
+        self.apps
+            .iter()
+            .find(|app| app.tools.iter().any(|tool| tool.tool.name == tool_name))
     }
 
     async fn call_tool_impl(
@@ -423,6 +454,7 @@ impl Running {
         let tool_name = request.name;
         let app_param = extract_app_param(extensions);
         let axum_parts = extensions.get::<axum::http::request::Parts>();
+        let mut served_by_app = app_param.is_some();
 
         let mut result = if tool_name == INTROSPECT_TOOL_NAME
             && let Some(introspect_tool) = &self.introspect_tool
@@ -527,6 +559,21 @@ impl Running {
             .await
             {
                 res
+            } else if let Some(app) = self.exposed_app_for_tool(&tool_name)
+                && let Some(res) = find_and_execute_app_tool(
+                    &self.apps,
+                    &app.name,
+                    &tool_name,
+                    &headers,
+                    request.arguments.as_ref(),
+                    &self.endpoint,
+                    &self.rhai_engine,
+                    axum_parts,
+                )
+                .await
+            {
+                served_by_app = true;
+                res
             } else {
                 Err(tool_not_found(&tool_name))
             }
@@ -555,7 +602,7 @@ impl Running {
             .add(1, &attributes);
 
         // MCP Apps rely on structured_content; only strip for non-app calls with older protocol versions.
-        if app_param.is_none()
+        if !served_by_app
             && !self.client_supports_output_schema(protocol_version)
             && let Ok(r) = &mut result
         {
@@ -597,6 +644,11 @@ impl Running {
                     ));
                 }
             }
+        } else if self.expose_all_apps {
+            self.apps
+                .iter()
+                .map(|app| attach_resource_mime_type(app.resource()))
+                .collect()
         } else {
             vec![]
         };
@@ -658,11 +710,19 @@ impl Running {
             )
         })?;
         let app_param = extract_app_param(&extensions);
+        let target_is_explicit = app_target_param(&extensions).is_some();
         let app_target = AppTarget::try_from((extensions, peer.client_capabilities))?;
 
-        if let Some(app_name) = app_param {
-            let (resource, origin) =
-                get_app_resource(&self.apps, request, request_uri, &app_target, &app_name).await?;
+        if app_param.is_some() || self.expose_all_apps {
+            let (resource, origin) = get_app_resource(
+                &self.apps,
+                request,
+                request_uri,
+                &app_target,
+                app_param.as_deref(),
+                target_is_explicit,
+            )
+            .await?;
             let result = ReadResourceResult::new(vec![resource]);
             Ok(origin
                 .caching(self.caching)
@@ -1825,6 +1885,7 @@ mod tests {
             schema,
             operations: Arc::new(RwLock::new(vec![])),
             apps: vec![],
+            expose_all_apps: false,
             prompts: vec![],
             headers: HeaderMap::new(),
             forward_headers: vec![],
@@ -1900,6 +1961,7 @@ mod tests {
 
         Running {
             apps: vec![app],
+            expose_all_apps: false,
             ..test_running(Arc::new(RwLock::new(schema)))
         }
     }
@@ -2811,6 +2873,33 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn resource_list_includes_every_app_when_expose_all() {
+            let mut running = running_with_apps(
+                AppResource::Single(AppResourceSource::Local("abcdef".to_string())),
+                None,
+                None,
+            );
+            let mut other = running.apps[0].clone();
+            other.name = "OtherApp".to_string();
+            other.uri = "http://localhost:4000/other#5678".parse().unwrap();
+            running.apps.push(other);
+            running.expose_all_apps = true;
+
+            let resources = running
+                .list_resources_impl(&Extensions::new(), None)
+                .unwrap()
+                .resources;
+
+            let uris: Vec<_> = resources.iter().map(|r| r.uri.as_str()).collect();
+            assert_eq!(uris, [RESOURCE_URI, "http://localhost:4000/other#5678"]);
+            assert!(
+                resources
+                    .iter()
+                    .all(|r| r.mime_type.as_deref() == Some("text/html;profile=mcp-app"))
+            );
+        }
+
+        #[tokio::test]
         async fn resource_list_with_nonexistent_app() {
             let mut extensions = Extensions::new();
             let request = axum::http::Request::builder()
@@ -2990,6 +3079,80 @@ mod tests {
                 )
                 .await;
             assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn read_resource_without_app_param_finds_app_by_uri_when_expose_all() {
+            let mut running = running_with_apps(
+                AppResource::Single(AppResourceSource::Local("abcdef".to_string())),
+                None,
+                None,
+            );
+            let mut other = running.apps[0].clone();
+            other.name = "OtherApp".to_string();
+            other.uri = "http://localhost:4000/other#5678".parse().unwrap();
+            other.resource = AppResource::Single(AppResourceSource::Local("other".to_string()));
+            running.apps.push(other);
+            running.expose_all_apps = true;
+
+            let mut result = running
+                .read_resource_impl(
+                    ReadResourceRequestParams::new("http://localhost:4000/other"),
+                    Extensions::new(),
+                    PeerContext::default(),
+                )
+                .await
+                .unwrap();
+
+            let Some(ResourceContents::TextResourceContents { text, .. }) = result.contents.pop()
+            else {
+                panic!("Expected TextResourceContents");
+            };
+            assert_eq!(text, "other");
+        }
+
+        #[tokio::test]
+        async fn read_resource_falls_back_to_the_only_target_when_none_is_requested() {
+            let running = running_with_apps(
+                AppResource::Targeted(crate::apps::app::TargetedAppResource {
+                    openai: None,
+                    mcp: Some(AppResourceSource::Local("mcp only".to_string())),
+                }),
+                None,
+                None,
+            );
+
+            let read = |uri: &'static str| {
+                let mut extensions = Extensions::new();
+                let (parts, _) = axum::http::Request::builder()
+                    .uri(uri)
+                    .body(())
+                    .unwrap()
+                    .into_parts();
+                extensions.insert(parts);
+                running.read_resource_impl(
+                    ReadResourceRequestParams::new("http://localhost:4000/resource"),
+                    extensions,
+                    PeerContext::default(),
+                )
+            };
+
+            // No appTarget: the server assumes openai, which this app lacks.
+            let mut result = read("http://localhost?app=MyApp").await.unwrap();
+            let Some(ResourceContents::TextResourceContents { text, .. }) = result.contents.pop()
+            else {
+                panic!("Expected TextResourceContents");
+            };
+            assert_eq!(text, "mcp only");
+
+            // An explicit target is never substituted.
+            let err = read("http://localhost?app=MyApp&appTarget=openai")
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.message,
+                "Invalid apps target: no resource found for openai"
+            );
         }
 
         #[tokio::test]
@@ -3598,6 +3761,85 @@ mod tests {
             assert_eq!(result.tools.len(), 1);
             assert_eq!(result.tools[0].name, "GetId");
             assert_eq!(result.next_cursor, None);
+        }
+
+        #[tokio::test]
+        async fn list_tools_without_app_parameter_includes_app_tools_when_expose_all() {
+            let mut running = running_with_apps(
+                AppResource::Single(AppResourceSource::Local("test".to_string())),
+                None,
+                None,
+            );
+            running.expose_all_apps = true;
+
+            let result = running
+                .list_tools_impl(Extensions::new(), PeerContext::default())
+                .await
+                .unwrap();
+
+            assert_eq!(result.tools.len(), 1);
+            let tool = &result.tools[0];
+            assert_eq!(tool.name, "GetId");
+            let ui = tool
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("ui"))
+                .expect("app tool should carry ui metadata");
+            assert_eq!(ui.get("resourceUri").unwrap(), RESOURCE_URI);
+            assert_eq!(
+                ui.get("visibility").unwrap(),
+                &serde_json::json!(["model", "app"])
+            );
+        }
+
+        #[tokio::test]
+        async fn list_tools_omits_app_tool_shadowed_by_operation_when_expose_all() {
+            let mut running = running_with_apps(
+                AppResource::Single(AppResourceSource::Local("test".to_string())),
+                None,
+                None,
+            );
+            running.expose_all_apps = true;
+            // An operation tool with the same name as the app's tool.
+            let shadowing = running.apps[0].tools[0].operation.as_ref().clone();
+            running.operations = Arc::new(RwLock::new(vec![shadowing]));
+
+            let result = running
+                .list_tools_impl(Extensions::new(), PeerContext::default())
+                .await
+                .unwrap();
+
+            assert_eq!(result.tools.len(), 1);
+            assert_eq!(result.tools[0].name, "GetId");
+            assert!(
+                result.tools[0]
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("ui"))
+                    .is_none(),
+                "the operation tool should be listed, not the app tool"
+            );
+        }
+
+        #[test]
+        fn expose_all_rejects_duplicate_app_tool_names() {
+            let running = running_with_apps(
+                AppResource::Single(AppResourceSource::Local("test".to_string())),
+                None,
+                None,
+            );
+            let mut other = running.apps[0].clone();
+            other.name = "OtherApp".to_string();
+            let apps = vec![running.apps[0].clone(), other];
+
+            let err = crate::apps::ensure_unique_names(&apps).unwrap_err();
+            assert!(err.contains("both define a tool named GetId"), "{err}");
+
+            let same_name = vec![running.apps[0].clone(), running.apps[0].clone()];
+            let err = crate::apps::ensure_unique_names(&same_name).unwrap_err();
+            assert!(err.contains("more than one app is named MyApp"), "{err}");
+
+            assert!(crate::apps::ensure_unique_names(&running.apps).is_ok());
         }
 
         #[tokio::test]
@@ -4412,6 +4654,7 @@ mod tests {
             let running = Running {
                 operations: Arc::new(RwLock::new(vec![operation])),
                 apps: vec![app],
+                expose_all_apps: false,
                 endpoint: server.url().parse().unwrap(),
                 enable_output_schema: true,
                 gen_ai_content: false,
@@ -4436,6 +4679,125 @@ mod tests {
 
             app_tool_mock.assert();
             operation_mock.assert();
+        }
+
+        #[tokio::test]
+        async fn calls_app_tool_without_app_param_when_expose_all() {
+            let mut server = mockito::Server::new_async().await;
+
+            let operation_mock = server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::Regex(
+                    r#".*"operationName"\s*:\s*"Hello".*"#.to_string(),
+                ))
+                .with_body(r#"{"data": {"hello": "from operation"}}"#)
+                .with_header("Content-Type", "application/json")
+                .expect(1)
+                .create_async()
+                .await;
+
+            let app_tool_mock = server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::Regex(
+                    r#".*"operationName"\s*:\s*"AppHello".*"#.to_string(),
+                ))
+                .with_body(r#"{"data": {"hello": "from app"}}"#)
+                .with_header("Content-Type", "application/json")
+                .expect(1)
+                .create_async()
+                .await;
+
+            let schema =
+                apollo_compiler::Schema::parse_and_validate("type Query { hello: String }", "test")
+                    .unwrap();
+
+            let into_operation = |source: &str| {
+                RawOperation::from((source.to_string(), None))
+                    .into_operation(
+                        &schema,
+                        None,
+                        MutationMode::None,
+                        false,
+                        false,
+                        true,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                        &HashMap::new(),
+                    )
+                    .unwrap()
+                    .expect("operation should be valid")
+            };
+            let operation = into_operation("query Hello { hello }");
+            let app_operation = into_operation("query AppHello { hello }");
+
+            let app = App {
+                name: "MyApp".to_string(),
+                description: None,
+                resource: AppResource::Single(AppResourceSource::Local("test".to_string())),
+                csp_settings: None,
+                widget_settings: None,
+                uri: "ui://MyApp".parse().unwrap(),
+                tools: vec![AppTool {
+                    operation: Arc::new(app_operation),
+                    labels: AppLabels::default(),
+                    tool: Tool::new("AppHello", "app tool", JsonObject::new()),
+                    extra_outputs: None,
+                }],
+                prefetch_operations: vec![],
+            };
+
+            let running = Running {
+                operations: Arc::new(RwLock::new(vec![operation.clone()])),
+                apps: vec![app],
+                expose_all_apps: true,
+                endpoint: server.url().parse().unwrap(),
+                enable_output_schema: true,
+                gen_ai_content: false,
+                ..test_running(Arc::new(RwLock::new(schema)))
+            };
+            let extensions = Extensions::new();
+
+            // The app tool is reachable with no `app` query parameter, and its
+            // structured content survives for clients on an older protocol.
+            let mut request = CallToolRequestParams::new("AppHello");
+            request.arguments = Some(Default::default());
+            assert!(running.is_graphql_tool(&request, &extensions, None));
+            let result = running
+                .call_tool_impl(request, &extensions, None, None)
+                .await
+                .unwrap();
+            assert!(result.structured_content.is_some());
+
+            // Operation tools keep working on the same connection.
+            let mut request = CallToolRequestParams::new("Hello");
+            request.arguments = Some(Default::default());
+            running
+                .call_tool_impl(request, &extensions, None, Some(operation))
+                .await
+                .unwrap();
+
+            app_tool_mock.assert();
+            operation_mock.assert();
+        }
+
+        #[tokio::test]
+        async fn app_tool_is_not_found_without_app_param_by_default() {
+            let running = running_with_apps(
+                AppResource::Single(AppResourceSource::Local("test".to_string())),
+                None,
+                None,
+            );
+            let extensions = Extensions::new();
+            let mut request = CallToolRequestParams::new("GetId");
+            request.arguments = Some(Default::default());
+
+            assert!(!running.is_graphql_tool(&request, &extensions, None));
+            assert!(
+                running
+                    .call_tool_impl(request, &extensions, None, None)
+                    .await
+                    .is_err()
+            );
         }
     }
 }
@@ -4539,6 +4901,7 @@ mod integration_tests {
                 schema: Arc::new(RwLock::new(schema)),
                 operations: Arc::new(RwLock::new(vec![operation])),
                 apps: vec![],
+                expose_all_apps: false,
                 prompts: vec![],
                 headers: http::HeaderMap::new(),
                 forward_headers: vec![],
@@ -5064,6 +5427,7 @@ mod integration_tests {
                 schema: Arc::new(RwLock::new(schema)),
                 operations: Arc::new(RwLock::new(vec![operation])),
                 apps: vec![],
+                expose_all_apps: false,
                 prompts: vec![],
                 headers: http::HeaderMap::new(),
                 forward_headers: vec![],
@@ -6049,6 +6413,7 @@ mod integration_tests {
                 schema: Arc::new(RwLock::new(schema)),
                 operations: Arc::new(RwLock::new(vec![])),
                 apps: vec![],
+                expose_all_apps: false,
                 prompts: vec![],
                 headers: http::HeaderMap::new(),
                 forward_headers: vec![],
@@ -6236,6 +6601,7 @@ mod integration_tests {
                 schema: Arc::new(RwLock::new(schema)),
                 operations: Arc::new(RwLock::new(vec![])),
                 apps: vec![],
+                expose_all_apps: false,
                 prompts: vec![],
                 headers: http::HeaderMap::new(),
                 forward_headers: vec![],
