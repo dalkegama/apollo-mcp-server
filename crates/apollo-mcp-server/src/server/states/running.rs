@@ -454,7 +454,9 @@ impl Running {
         let tool_name = request.name;
         let app_param = extract_app_param(extensions);
         let axum_parts = extensions.get::<axum::http::request::Parts>();
-        let mut served_by_app = app_param.is_some();
+        // With `expose_all`, an app's UI calls tools (such as `execute`) on a connection that has
+        // no app parameter, and it reads the result from structured_content.
+        let mut served_by_app = app_param.is_some() || self.expose_all_apps;
 
         let mut result = if tool_name == INTROSPECT_TOOL_NAME
             && let Some(introspect_tool) = &self.introspect_tool
@@ -4511,6 +4513,64 @@ mod tests {
             assert!(
                 result.structured_content.is_none(),
                 "structured_content should be stripped with default protocol version"
+            );
+        }
+
+        #[tokio::test]
+        async fn keeps_structured_content_without_app_param_when_expose_all() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("POST", "/")
+                .with_body(r#"{"data": {"hello": "world"}}"#)
+                .create_async()
+                .await;
+
+            let schema =
+                apollo_compiler::Schema::parse_and_validate("type Query { hello: String }", "test")
+                    .unwrap();
+
+            let raw_op: RawOperation = ("query Hello { hello }".to_string(), None).into();
+            let operation = raw_op
+                .into_operation(
+                    &schema,
+                    None,
+                    MutationMode::None,
+                    false,
+                    false,
+                    true,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &HashMap::new(),
+                )
+                .unwrap()
+                .expect("operation should be valid");
+
+            let running = Running {
+                operations: Arc::new(RwLock::new(vec![operation])),
+                endpoint: server.url().parse().unwrap(),
+                enable_output_schema: true,
+                expose_all_apps: true,
+                gen_ai_content: false,
+                ..test_running(Arc::new(RwLock::new(schema)))
+            };
+
+            let mut request = CallToolRequestParams::new("Hello");
+            request.arguments = Some(Default::default());
+
+            let result = running
+                .call_tool_impl(
+                    request,
+                    &Extensions::new(),
+                    Some(&ProtocolVersion::V_2025_03_26),
+                    Some(running.operations.read().await[0].clone()),
+                )
+                .await
+                .unwrap();
+
+            mock.assert();
+            assert!(
+                result.structured_content.is_some(),
+                "apps read structured_content, so expose_all must keep it"
             );
         }
 
